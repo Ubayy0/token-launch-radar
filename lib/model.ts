@@ -23,6 +23,8 @@
 // The constants are stated in the dashboard and changeable in the model sandbox. No protocol name is
 // ever special-cased: the same function scores every row.
 
+import { compsCountFor, rankByBand, sensitivityBand, sensitivityByCategory, sensitivitySummary, type CategorySensitivity, type SensitivityBand } from './sensitivity.ts';
+
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
@@ -134,6 +136,9 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  sensitivity: SensitivityBand;
+  rank_low: number;
+  rank_high: number;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -153,6 +158,11 @@ export interface RadarRow {
   breadth_multiplier: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
+  confidence: number;
+  rank_low: number;
+  rank_high: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -178,6 +188,9 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  sensitivity_summary: { high: number; medium: number; low: number };
+  median_width_pct: number;
+  sensitivity_by_category: CategorySensitivity[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -328,9 +341,26 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const { implied, growthPct, growthMult, maturityMult, age, catMultiple, breadthMult } = impliedValue(p, snapshot.as_of, model, comps);
-    return { p, implied, growthPct, growthMult, maturityMult, age, catMultiple, breadthMult };
+    // The sensitivity band: the same row's inputs, stressed on the multiple and the growth.
+    const sensitivity = sensitivityBand(
+      {
+        tvl_usd: p.tvl_usd,
+        category_multiple: catMultiple,
+        breadth_multiplier: breadthMult,
+        growth_pct: growthPct,
+        maturity_multiplier: maturityMult,
+        comps_n: compsCountFor(p.category, comps),
+      },
+      implied,
+      model,
+    );
+    return { p, implied, growthPct, growthMult, maturityMult, age, catMultiple, breadthMult, sensitivity };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  // Where each rank would land if every row were scored at its low — or its high — implied value.
+  const bandRows = scored.map((s) => ({ slug: s.p.slug, implied_low_usd: s.sensitivity.implied_low_usd, implied_high_usd: s.sensitivity.implied_high_usd }));
+  const rankLow = rankByBand(bandRows, 'low');
+  const rankHigh = rankByBand(bandRows, 'high');
   return scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
@@ -355,6 +385,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    sensitivity: s.sensitivity,
+    rank_low: rankLow.get(s.p.slug)!,
+    rank_high: rankHigh.get(s.p.slug)!,
   }));
 }
 
@@ -502,6 +535,11 @@ export function radarRow(row: BoardRow): RadarRow {
     breadth_multiplier: row.model.breadth_multiplier,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    implied_low_usd: row.sensitivity.implied_low_usd,
+    implied_high_usd: row.sensitivity.implied_high_usd,
+    confidence: row.sensitivity.confidence,
+    rank_low: row.rank_low,
+    rank_high: row.rank_high,
   };
 }
 
@@ -511,6 +549,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const comps = computeComps(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const sensitivity_summary = sensitivitySummary(board.map((r) => r.sensitivity.confidence));
+  const widths = board.map((r) => r.sensitivity.width_pct).sort((a, b) => a - b);
+  const median_width_pct = Math.round(medianOf(widths) * 10) / 10;
+  const sensitivity_by_category = sensitivityByCategory(
+    board.map((r) => ({ category: r.category, width_pct: r.sensitivity.width_pct, confidence: r.sensitivity.confidence })),
+  );
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -522,6 +566,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    sensitivity_summary,
+    median_width_pct,
+    sensitivity_by_category,
     rows: board.map(radarRow),
     live,
   };
@@ -587,6 +634,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (r.sensitivity.implied_low_usd > r.implied_value_usd || r.sensitivity.implied_high_usd < r.implied_value_usd) return `${r.slug} has a band that does not bracket its implied value`;
+    if (r.rank_low < 1 || r.rank_low > board.length || r.rank_high < 1 || r.rank_high > board.length) return `${r.slug} has a rank outside the board`;
   }
   return null;
 }
